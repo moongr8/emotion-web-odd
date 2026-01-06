@@ -1,0 +1,367 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>감정 반응 인터랙티브</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+</head>
+
+<body>
+<script>
+let video;
+let faceMesh;
+let detections = [];
+let emotion = "neutral";
+
+// ✅ 도형 시스템
+let shapes = [];
+let stableEmotion = "neutral";
+let candidateEmotion = "neutral";
+let candidateFrames = 0;
+const HOLD_FRAMES = 18;
+
+// ✅ 감정 변경 시 자연 전환(정리)
+let prevStableEmotion = "neutral";
+const TRANSITION_FRAMES = 60;
+
+// ✅ 화면 밖 사라짐 설정
+const MAX_SHAPES = 400;
+
+/* =========================
+   ✅ (추가) 카메라 비율 유지(COVER) + 미러 렌더
+   - 얼굴이 찌그러지지 않게 비율 유지
+   - 대신 캔버스에 맞추며 가장자리 일부가 크롭될 수 있음
+   - 랜드마크 점도 동일한 좌표계로 맞추기 위해 drawRect 저장
+========================= */
+let videoDraw = { dx: 0, dy: 0, dw: 0, dh: 0 };
+
+function drawMirroredVideoCover() {
+  const vw = video.elt.videoWidth || video.width || width;
+  const vh = video.elt.videoHeight || video.height || height;
+
+  const canvasAR = width / height;
+  const videoAR  = vw / vh;
+
+  let dw, dh;
+  if (canvasAR > videoAR) {
+    dw = width;
+    dh = width / videoAR;
+  } else {
+    dh = height;
+    dw = height * videoAR;
+  }
+
+  const dx = (width - dw) / 2;
+  const dy = (height - dh) / 2;
+
+  // 랜드마크 매핑용 저장
+  videoDraw.dx = dx;
+  videoDraw.dy = dy;
+  videoDraw.dw = dw;
+  videoDraw.dh = dh;
+
+  // ✅ 미러 + cover 렌더 (흑백)
+  push();
+  translate(dx + dw, dy);
+  scale(-1, 1);
+  image(video, 0, 0, dw, dh);
+  // 흑백 필터 적용
+  filter(GRAY);
+  pop();
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  video = createCapture(VIDEO);
+  video.size(width, height);
+  video.hide();
+
+  faceMesh = new FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+  });
+  faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5 });
+  faceMesh.onResults(gotResults);
+
+  const camera = new Camera(video.elt, {
+    onFrame: async () => await faceMesh.send({ image: video.elt }),
+    width: width,
+    height: height
+  });
+  camera.start();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  video.size(windowWidth, windowHeight);
+}
+
+function gotResults(results) {
+  if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+    detections = results.multiFaceLandmarks[0];
+    emotion = detectEmotion(detections);
+  } else {
+    detections = [];
+    emotion = "neutral";
+  }
+}
+
+function draw() {
+  // ✅ (수정) 좌우반전(미러) + 비율 유지(COVER) 카메라 (흑백)
+  drawMirroredVideoCover();
+
+  updateStableEmotion();
+
+  spawnShapes();
+  updateAndDrawShapes();
+
+  if (detections.length > 0) drawKeyLandmarks(detections);
+
+  fill(255);
+  noStroke();
+  textSize(18);
+  textAlign(CENTER, BOTTOM);
+  text(stableEmotion, width / 2, height - 10);
+}
+
+// 감정 감지
+function detectEmotion(landmarks) {
+  const mouthCenterY = landmarks[13].y;
+  const leftCornerY  = landmarks[61].y;
+  const rightCornerY = landmarks[291].y;
+  const avgCornerY   = (leftCornerY + rightCornerY) / 2;
+
+  const mh = dist(
+    landmarks[13].x, landmarks[13].y,
+    landmarks[14].x, landmarks[14].y
+  );
+
+  // ✅ neutral 폭 줄이기: happy/sad 임계값을 조금 더 민감하게
+  const HAPPY_TH = 0.008; // 기존 0.01 -> 더 잘 happy로 잡힘
+  const SAD_TH   = 0.004; // 기존 0.01 -> "조금만 내려가도" sad로 잡힘
+
+  // ✅ angry는 "정말 일직선"일 때만: EPS를 더 작게(더 엄격)
+  const ANGRY_EPS = 0.0015; // 기존 0.004 -> angry 조건 더 빡세게
+
+  if (mh > 0.05) return "surprised";
+  if (avgCornerY < mouthCenterY - HAPPY_TH) return "happy";
+  if (avgCornerY > mouthCenterY + SAD_TH) return "sad";
+
+  // ✅ angry: 입술 점 3개(61, 13, 291)의 y가 거의 완전 동일 + 입 거의 안 벌어짐
+  const isFlatMouth =
+    abs(leftCornerY - mouthCenterY) < ANGRY_EPS &&
+    abs(rightCornerY - mouthCenterY) < ANGRY_EPS;
+
+  if (isFlatMouth && mh < 0.025) return "angry";
+
+  return "neutral";
+}
+
+
+
+function updateStableEmotion() {
+  const current = (detections.length > 0) ? emotion : "neutral";
+
+  if (current === candidateEmotion) {
+    candidateFrames++;
+  } else {
+    candidateEmotion = current;
+    candidateFrames = 1;
+  }
+
+  if (candidateFrames >= HOLD_FRAMES) {
+    if (stableEmotion !== candidateEmotion) {
+      prevStableEmotion = stableEmotion;
+      stableEmotion = candidateEmotion;
+      onEmotionChanged(stableEmotion);
+    }
+  }
+}
+
+function onEmotionChanged(newEmotion) {
+  const targetType = shapeTypeForEmotion(newEmotion);
+  if (targetType === "mixed") return;
+
+  for (const s of shapes) {
+    s.setTargetType(targetType);
+  }
+}
+
+function shapeTypeForEmotion(e) {
+  if (e === "happy") return "circle";
+  if (e === "sad") return "triangle";
+  if (e === "angry") return "cross";
+  if (e === "surprised") return "square";
+  return "mixed";
+}
+
+function spawnShapes() {
+  if (shapes.length >= MAX_SHAPES) return;
+
+  const type = shapeTypeForEmotion(stableEmotion);
+  const interval = (stableEmotion === "neutral") ? 24 : 18;
+  if (frameCount % interval !== 0) return;
+
+  let t;
+  if (type === "mixed") {
+    const pool = ["circle", "square", "triangle", "cross"];
+    t = random(pool);
+  } else {
+    t = type;
+  }
+
+  shapes.push(new FloatingShape(t, stableEmotion));
+}
+
+function updateAndDrawShapes() {
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    shapes[i].update();
+    if (shapes[i].dead) shapes.splice(i, 1);
+  }
+
+  for (let i = 0; i < shapes.length; i++) {
+    shapes[i].draw();
+  }
+}
+
+class FloatingShape {
+  constructor(type, emo) {
+    this.type = type;
+    this.emo = emo;
+
+    this.targetType = type;
+    this.transitionStart = -1;
+    this.transitionDelay = 0;
+
+    this.size = 250;
+    this.r = this.size / 2;
+
+    // ✅✅✅ 아래 "전체 가로 영역"에서 랜덤하게 생성
+    this.x = random(this.r, width - this.r);
+    this.y = height + random(10, 120); // 아래쪽에서 조금만 여유
+
+    this.vy = random(0.9, 2.6);
+    this.vx = random(-0.6, 0.6);
+
+    this.rot = random(TWO_PI);
+    this.rotSpeed = random(-0.03, 0.03);
+
+    this.alpha = random(80, 200);
+    this.dead = false;
+
+    if (emo === "sad") {
+      this.vy *= 0.75;
+      this.vx *= 0.3;
+      this.rotSpeed *= 0.4;
+    }
+    if (emo === "angry") {
+      this.vy *= 1.25;
+      this.rotSpeed *= 1.5;
+    }
+    if (emo === "surprised") {
+      this.vy *= 1.1;
+      this.vx *= 1.2;
+    }
+    if (emo === "happy") {
+      this.rotSpeed *= 0.9;
+    }
+  }
+
+  setTargetType(nextType) {
+    if (!nextType || nextType === "mixed") return;
+    if (this.targetType === nextType && this.type === nextType) return;
+
+    this.targetType = nextType;
+    this.transitionStart = frameCount;
+    this.transitionDelay = floor(random(0, 30));
+  }
+
+  update() {
+    this.y -= this.vy;
+    this.x += this.vx;
+    this.rot += this.rotSpeed;
+
+    const margin = this.size * 1.2;
+    if (this.y < -margin || this.x < -margin || this.x > width + margin) {
+      this.dead = true;
+    }
+  }
+
+  draw() {
+    push();
+    translate(this.x, this.y);
+    rotate(this.rot);
+
+    let sw = 2;
+    if (this.emo === "sad") sw = 7.0;
+    if (this.emo === "angry") sw = 7.0;
+    if (this.emo === "surprised") sw = 7.0;
+    strokeWeight(sw);
+
+    let t = 1;
+    if (this.transitionStart >= 0) {
+      const elapsed = frameCount - (this.transitionStart + this.transitionDelay);
+      t = constrain(elapsed / TRANSITION_FRAMES, 0, 1);
+    }
+
+    const aOld = this.alpha * (1 - t);
+    const aNew = this.alpha * (t);
+
+    if (aOld > 0.5) {
+      stroke(255, aOld);
+      noFill();
+      drawShapeByType(this.type, this.size);
+    }
+    if (aNew > 0.5) {
+      stroke(255, aNew);
+      noFill();
+      drawShapeByType(this.targetType, this.size);
+    }
+
+    if (t >= 1 && this.transitionStart >= 0) {
+      this.type = this.targetType;
+      this.transitionStart = -1;
+    }
+
+    pop();
+  }
+}
+
+function drawShapeByType(type, size) {
+  if (type === "circle") {
+    ellipse(0, 0, size);
+  } else if (type === "square") {
+    rectMode(CENTER);
+    rect(0, 0, size, size);
+  } else if (type === "triangle") {
+    triangle(-size/2, -size/3, size/2, -size/3, 0, size/2);
+  } else if (type === "cross") {
+    line(-size/2, -size/2, size/2, size/2);
+    line(-size/2,  size/2, size/2, -size/2);
+  }
+}
+
+function drawKeyLandmarks(landmarks) {
+  fill(255, 255, 255);
+  noStroke();
+  const keyIndices = [13, 14, 61, 291, 159, 386];
+
+  // ✅ (수정) cover 렌더 좌표계에 맞춰 점도 같이 매핑
+  const dx = videoDraw.dx;
+  const dy = videoDraw.dy;
+  const dw = videoDraw.dw || width;
+  const dh = videoDraw.dh || height;
+
+  for (let i of keyIndices) {
+    const pt = landmarks[i];
+    const mx = dx + (1 - pt.x) * dw; // 미러 + cover
+    const my = dy + pt.y * dh;
+    ellipse(mx, my, 6, 6);
+  }
+}
+</script>
+</body>
+</html>
+```
